@@ -1,0 +1,104 @@
+// src/workers/commandProcessor.ts
+
+// Import necessary types and classes
+import { QueueHandler, Message } from '@cloudflare/workers-types';
+import { DatabaseService } from '../services/database';
+import { StorageService } from '../services/storage';
+import { CommandQueueMessage, LLMTaskQueueMessage } from '../types';
+
+// Define the environment type for this specific queue consumer worker
+// It needs access to D1, AI (for potential future use or config loading), R2, KV secrets, and the producer binding for the next queue
+interface CommandProcessorEnv {
+  DB: D1Database;
+  AI: Ai; // Might be needed if loading configs that require AI (unlikely) or for future extensions
+  MEMORY_BUCKET: R2Bucket;
+  SECRETS: KVNamespace;
+  LLM_TASK_QUEUE: Queue<LLMTaskQueueMessage>; // Producer binding to send messages to the next queue
+  // Variables from wrangler.toml
+  SYSTEM_PROMPT_PATH: string;
+  TOOLS_PATH: string;
+  // Note: Accessing DAILY_AI_LIMIT, AI_INFERENCE_COUNTER_KV_KEY might be easier in the AI service
+  // or passed down, rather than accessed directly here for rate limiting the *next* step.
+  // This consumer handles the *current* step's rate limiting implicitly by being queued.
+}
+
+// Define the QueueHandler for the command processor
+export const commandProcessor: QueueHandler<CommandProcessorEnv> = {
+  // The fetch handler is not used for queue consumers
+  async fetch(request: Request, env: CommandProcessorEnv, ctx: ExecutionContext): Promise<Response> {
+    return new Response('Not Found', { status: 404 }); // Consumers don't handle direct requests
+  },
+
+  // The main logic resides in the handleMessage function
+  async handleMessage(message: Message<CommandQueueMessage>, env: CommandProcessorEnv, ctx: ExecutionContext): Promise<void> {
+    console.log("Command Processor Consumer: Received message:", message.body);
+
+    // Destructure the message job details
+    const { jobId, chatId, messageId, command, userInput } = message.body;
+
+    // Instantiate services using the environment bindings
+    const dbService = new DatabaseService(env.DB);
+    const storageService = new StorageService(env.MEMORY_BUCKET);
+
+    try {
+      // 1. Update the job status in D1 to reflect that processing has started
+      console.log(`Command Processor: Updating status for job ${jobId} to 'processing'.`);
+      await dbService.updateJobStatus(jobId, 'processing');
+
+      // 2. Load the current agent configuration (system prompt, tools) from R2
+      // This ensures the agent uses the latest configuration for this task
+      console.log(`Command Processor: Loading configuration for job ${jobId}.`);
+      const config = await storageService.loadConfig({
+        systemPrompt: env.SYSTEM_PROMPT_PATH,
+        tools: env.TOOLS_PATH
+      });
+
+      // 3. Determine the next step based on the received command
+      console.log(`Command Processor: Processing command '${command}' for job ${jobId}.`);
+      if (command === '/analyze') {
+        // Prepare the payload for the LLM task queue
+        const llmPayload: LLMTaskQueueMessage = {
+          jobId,
+          chatId,
+          inputText: userInput, // Pass the user's input (e.g., the transcript text)
+          commandType: 'analyze_transcript', // Define a specific type for this command
+          systemPrompt: config.systemPrompt, // Pass the loaded system prompt
+          tools: config.tools // Pass the loaded tools (if the LLM needs them directly, unlikely for meta models)
+        };
+
+        // 4. Send the prepared message to the LLM Task Queue
+        console.log(`Command Processor: Sending LLM task for job ${jobId} to LLM_TASK_QUEUE.`);
+        await env.LLM_TASK_QUEUE.send(llmPayload);
+
+      } else if (command === '/status') {
+        // Example of a command handled directly by this consumer
+        console.log(`Command Processor: Handling '/status' command for job ${jobId} directly.`);
+        const currentStatus = await dbService.getJobStatus(jobId);
+        const statusMessage = `Current status for your request: ${currentStatus?.status || 'unknown'}`;
+        // In a full implementation, you'd send this status back to the user via Telegram API here.
+        // For now, just update the job status as completed.
+        await dbService.updateJobStatus(jobId, 'completed', statusMessage);
+
+      } else {
+        // Handle unknown commands
+        console.log(`Command Processor: Unknown command '${command}' for job ${jobId}.`);
+        await dbService.updateJobStatus(jobId, 'error', `Unknown command: ${command}`);
+      }
+
+    } catch (error) {
+      // 5. Handle any errors that occur during processing
+      console.error(`Command Processor: Error processing command for job ${jobId}:`, error);
+      // Update the job status in D1 to reflect the error
+      await dbService.updateJobStatus(jobId, 'error', (error as Error).message);
+    }
+  },
+};
+
+// Note: This file exports the 'commandProcessor' object, which is a QueueHandler.
+// In your wrangler.toml, you will link the 'cmd-processor-queue' consumer to this worker script,
+// and potentially specify the export name 'commandProcessor' if your main worker script exports multiple handlers.
+// Example wrangler.toml consumer link (this goes in your main wrangler.toml):
+// [[queues.consumers]]
+// queue = "cmd-processor-queue"
+// script = "educational-hermes-agent-router" # Name of the deployed script (from main worker)
+// entrypoint = "commandProcessor"          # Name of the exported QueueHandler
