@@ -1,0 +1,18 @@
+{
+  "name": "educational-hermes-agent",
+  "version": "1.0.0",
+  "description": "Educational serverless AI agent using Cloudflare Workers",
+  "main": "src/router.ts",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  },
+  "dependencies": {
+    "@cloudflare/ai": "^1.0.0", // Cloudflare Workers AI binding
+    "@cloudflare/workers-types": "^4.20240403.0", // TypeScript types for Workers
+    "hono": "^3.12.0" // Fast, lightweight web framework
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0" // Cloudflare CLI tool
+  }
+}
