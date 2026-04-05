@@ -1,0 +1,60 @@
+// src/workers/memoryManager.ts
+
+// Import necessary types and classes
+import { QueueHandler, Message } from '@cloudflare/workers-types';
+import { DatabaseService } from '../services/database';
+import { StorageService } from '../services/storage';
+import { MemoryUpdateQueueMessage } from '../types';
+
+// Define the environment type for this specific queue consumer worker
+// It needs access to D1 (for indexing/status), R2 (for memory files), KV secrets (maybe for config paths), and potentially other queues for feedback loops
+interface MemoryManagerEnv {
+  DB: D1Database;
+  MEMORY_BUCKET: R2Bucket; // Primary storage for memory files
+  SECRETS: KVNamespace; // Potentially needed if fetching dynamic config paths or secrets related to memory management
+  // Variables from wrangler.toml
+  SHORT_TERM_MEMORY_PREFIX: string; // e.g., "memory/short_term_chat_"
+  LONG_TERM_MEMORY_FILE: string;    // e.g., "memory/long_term.parquet" (though handling parquet in Workers is complex, might stay as JSON initially)
+  MAX_SHORT_TERM_ENTRIES: string;   // e.g., "50"
+  SUGGESTIONS_DIR: string;          // e.g., "suggestions/"
+  // Note: Accessing AI for embeddings would require 'AI' binding and 'env' passed to a service if needed here.
+}
+
+// Define the QueueHandler for the memory manager
+export const memoryManager: QueueHandler<MemoryManagerEnv> = {
+  // The fetch handler is not used for queue consumers
+  async fetch(request: Request, env: MemoryManagerEnv, ctx: ExecutionContext): Promise<Response> {
+    return new Response('Not Found', { status: 404 }); // Consumers don't handle direct requests
+  },
+
+  // The main logic resides in the handleMessage function
+  async handleMessage(message: Message<MemoryUpdateQueueMessage>, env: MemoryManagerEnv, ctx: ExecutionContext): Promise<void> {
+    console.log("Memory Manager Consumer: Received message:", message.body);
+
+    // Destructure the message job details
+    const { jobId, chatId, llmResult, action, data } = message.body;
+
+    // Instantiate services using the environment bindings
+    const dbService = new DatabaseService(env.DB);
+    const storageService = new StorageService(env.MEMORY_BUCKET);
+
+    try {
+      // 1. Update the job status in D1 to reflect that memory processing has started
+      console.log(`Memory Manager: Updating status for job ${jobId} to 'processing memory'.`);
+      await dbService.updateJobStatus(jobId, 'processing'); // Or maybe 'memory_processing'?
+
+      // 2. Handle the specific memory action requested
+      console.log(`Memory Manager: Executing action '${action}' for job ${jobId}.`);
+      if (action === 'update_short_term') {
+        // --- UPDATE SHORT-TERM MEMORY ---
+        // Define the R2 key for this chat's short-term memory
+        const shortTermKey = `${env.SHORT_TERM_MEMORY_PREFIX}${chatId}.json`;
+
+        let shortTermMemory: any[] = [];
+
+        // 2a. Load existing short-term memory from R2
+        console.log(`Memory Manager: Attempting to load existing short-term memory for chat ${chatId} from ${shortTermKey}.`);
+        const existingShortTermStr = await storageService.readObject(shortTermKey);
+        if (existingShortTermStr) {
+          try {
+            shortTermMemory = JSON.parse(existingShortTerm
