@@ -1,0 +1,61 @@
+
+name = "educational-hermes-agent-router" # Matches your Cloudflare Worker name
+main = "src/router.ts"
+
+compatibility_date = "2024-04-05"
+workers_dev = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = "hellmess_around"
+database_id = "37b8955d-39e0-463f-9c45-"
+
+[[r2_buckets]]
+binding = "hellmess-memory"
+bucket_name = "0d85361c6163bcecec81f0e183ec65fe" # <<<<< REPLACE THIS
+
+[[queues.producers]]
+binding = "COMMAND_QUEUE"
+queue = "cmd-processor-queue"
+
+[[queues.producers]]
+binding = "LLM_TASK_QUEUE"
+queue = "llm-task-queue"
+
+[[queues.producers]]
+binding = "MEMORY_UPDATE_QUEUE"
+queue = "memory-update-queue"
+
+[[queues.consumers]]
+queue = "cmd-processor-queue"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "dlq-cmd-processor"
+message_retry_delay = 30
+
+[[queues.consumers]]
+queue = "llm-task-queue"
+max_batch_size = 1
+max_retries = 2
+dead_letter_queue = "dlq-llm-task"
+message_retry_delay = 60
+
+[[queues.consumers]]
+queue = "memory-update-queue"
+max_batch_size = 1
+max_retries = 3
+dead_letter_queue = "dlq-memory-update"
+message_retry_delay = 30
+
+[[kv_namespaces]] # Optional for secrets
+binding = "SECRETS"
+id = "your-kv-namespace-id-placeholder" # Get this via wrangler CLI later if used
+
+[vars]
+# These will be fetched from KV or secrets
+TELEGRAM_BOT_TOKEN_KEY = "8578876044:AAHjpr5qsTGN_GXdiEgj9oNLW4m1iFF_v8Q"
+TELEGRAM_WEBHOOK_SECRET_KEY = "TELEGRAM_WEBHOOK_SECRET"
+SYSTEM_PROMPT_PATH = "config/system_prompt_v1.txt"
+MAX_SHORT_TERM_ENTRIES = 50
+DAILY_AI_LIMIT = 10000
+AI_INFERENCE_COUNTER_KV_KEY = "ai_inference_count_today"
