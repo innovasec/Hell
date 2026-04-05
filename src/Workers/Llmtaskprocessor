@@ -1,0 +1,106 @@
+// src/workers/llmTaskProcessor.ts
+
+// Import necessary types and classes
+import { QueueHandler, Message } from '@cloudflare/workers-types';
+import { DatabaseService } from '../services/database';
+import { AIService } from '../services/ai'; // Import the AI service
+import { LLMTaskQueueMessage, MemoryUpdateQueueMessage, LLMResult } from '../types';
+
+// Define the environment type for this specific queue consumer worker
+// It needs access to D1, AI (for the model call), KV secrets (for rate limiting via AIService), R2 (maybe for future context), and the producer binding for the next queue
+interface LLMTaskProcessorEnv {
+  DB: D1Database;
+  AI: Ai; // Needed for the LLM call
+  MEMORY_BUCKET: R2Bucket; // Might be needed if fetching context before LLM call
+  SECRETS: KVNamespace; // Needed by AIService for rate limiting
+  MEMORY_UPDATE_QUEUE: Queue<MemoryUpdateQueueMessage>; // Producer binding to send messages to the next queue
+  // Variables from wrangler.toml (needed by AIService or passed down)
+  AI_INFERENCE_COUNTER_KV_KEY: string;
+  DAILY_AI_LIMIT: string;
+}
+
+// Define the QueueHandler for the LLM task processor
+export const llmTaskProcessor: QueueHandler<LLMTaskProcessorEnv> = {
+  // The fetch handler is not used for queue consumers
+  async fetch(request: Request, env: LLMTaskProcessorEnv, ctx: ExecutionContext): Promise<Response> {
+    return new Response('Not Found', { status: 404 }); // Consumers don't handle direct requests
+  },
+
+  // The main logic resides in the handleMessage function
+  async handleMessage(message: Message<LLMTaskQueueMessage>, env: LLMTaskProcessorEnv, ctx: ExecutionContext): Promise<void> {
+    console.log("LLM Task Processor Consumer: Received message:", message.body);
+
+    // Destructure the message job details
+    const { jobId, chatId, inputText, commandType, systemPrompt, tools } = message.body;
+
+    // Instantiate services using the environment bindings
+    const dbService = new DatabaseService(env.DB);
+    // IMPORTANT: Pass the full 'env' object to AIService so it can access SECRETS for rate limiting
+    const aiService = new AIService(env.AI, env);
+
+    try {
+      // 1. Update the job status in D1 to reflect that LLM processing has started
+      console.log(`LLM Task Processor: Updating status for job ${jobId} to 'processing'.`);
+      await dbService.updateJobStatus(jobId, 'processing'); // Or maybe a more specific 'llm_processing' status?
+
+      // 2. Construct the user prompt based on the command type and input text
+      // This is where you tailor the prompt for the specific task (e.g., analysis, Q&A)
+      let userPrompt = "";
+      if (commandType === 'analyze_transcript') {
+        userPrompt = `Analyze the following call transcript for key points, sentiment, and action items:\n\n${inputText}`;
+      } else if (commandType === 'answer_question') {
+          userPrompt = `Answer the following question based on general knowledge:\n\n${inputText}`;
+      } else {
+        // Default fallback - just pass the input text
+        userPrompt = inputText;
+      }
+
+      // 3. Call the AI service to run the LLM with Hermes-style prompting
+      // The AIService handles rate limiting internally.
+      console.log(`LLM Task Processor: Calling AI service for job ${jobId}.`);
+      const llmResult: LLMResult = await aiService.runHermesStyleInstruct(
+        { systemPrompt, tools, maxShortTermEntries: 50, dailyAILimit: 10000 }, // Pass config (limits could come from env)
+        userPrompt
+      );
+
+      // 4. Update the job status in D1 to reflect that the LLM call is done
+      // Store the LLM result in the 'details' field for potential later retrieval or logging
+      console.log(`LLM Task Processor: LLM call completed for job ${jobId}. Updating status to 'llm_done'.`);
+      await dbService.updateJobStatus(jobId, 'llm_done', JSON.stringify(llmResult));
+
+      // 5. Prepare the payload for the next step: Memory Update
+      // This payload tells the Memory Manager what to do with the LLM result.
+      const memoryUpdatePayload: MemoryUpdateQueueMessage = {
+        jobId,
+        chatId,
+        llmResult, // Pass the structured result object from the LLM
+        action: 'update_short_term', // Define the action for the memory manager (e.g., update short-term, index, etc.)
+         { input: inputText, result: llmResult, commandType } // Include relevant data for the action
+      };
+
+      // 6. Send the prepared message to the Memory Update Queue
+      console.log(`LLM Task Processor: Sending memory update task for job ${jobId} to MEMORY_UPDATE_QUEUE.`);
+      await env.MEMORY_UPDATE_QUEUE.send(memoryUpdatePayload);
+
+    } catch (error) {
+      // 7. Handle any errors that occur during LLM processing
+      console.error(`LLM Task Processor: Error processing LLM task for job ${jobId}:`, error);
+      let errorMessage = (error as Error).message;
+
+      // Provide a clearer message if it was a rate limit error from the AIService
+      if (errorMessage.includes("Daily AI inference limit reached")) {
+          errorMessage = "Processing paused: Daily AI inference limit reached.";
+      }
+
+      // Update the job status in D1 to reflect the error
+      await dbService.updateJobStatus(jobId, 'error', errorMessage);
+    }
+  },
+};
+
+// Note: Similar to commandProcessor.ts, this file exports the 'llmTaskProcessor' object.
+// Link this in your wrangler.toml consumer definition:
+// [[queues.consumers]]
+// queue = "llm-task-queue"
+// script = "educational-hermes-agent-router" # Name of the deployed script (from main worker)
+// entrypoint = "llmTaskProcessor"          # Name of the exported QueueHandler
